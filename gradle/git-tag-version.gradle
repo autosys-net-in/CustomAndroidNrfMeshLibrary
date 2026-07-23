@@ -1,0 +1,29 @@
+ext.getVersionCodeFromTags = { ->
+    try {
+        def listOfTags = providers
+                .exec { commandLine 'git', 'tag', '--list' }
+                .standardOutput
+                .asText.get()
+        // There were 42 tags so far. The first version after release using this script will
+        // have build version 100.
+        return (99 - 42) + listOfTags.split("\n").size()
+    }
+    catch (ignored) {
+        return -1
+    }
+}
+
+ext.getVersionNameFromTags = { ->
+    try {
+        def version = providers
+                .exec { commandLine 'git', 'describe', '--tags', '--abbrev=0' }
+                .standardOutput
+                .asText.get().trim()
+        // Version may have % to add additional information
+        return version.split("%")[0]
+    }
+    catch (ignored) {
+        ignored.printStackTrace()
+        return null
+    }
+}
