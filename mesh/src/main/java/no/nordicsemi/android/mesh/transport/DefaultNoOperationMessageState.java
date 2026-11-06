@@ -7,11 +7,9 @@ import static no.nordicsemi.android.mesh.utils.MeshAddress.isValidUnassignedAddr
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
-
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
-
 import no.nordicsemi.android.mesh.Features;
 import no.nordicsemi.android.mesh.Group;
 import no.nordicsemi.android.mesh.InternalTransportCallbacks;
@@ -24,6 +22,7 @@ import no.nordicsemi.android.mesh.control.TransportControlMessage;
 import no.nordicsemi.android.mesh.logger.MeshLogger;
 import no.nordicsemi.android.mesh.models.ConfigurationServerModel;
 import no.nordicsemi.android.mesh.models.SceneServer;
+import no.nordicsemi.android.mesh.models.VendorModel;
 import no.nordicsemi.android.mesh.opcodes.ApplicationMessageOpCodes;
 import no.nordicsemi.android.mesh.opcodes.ConfigMessageOpCodes;
 import no.nordicsemi.android.mesh.opcodes.ProxyConfigMessageOpCodes;
@@ -34,6 +33,8 @@ import no.nordicsemi.android.mesh.utils.NetworkTransmitSettings;
 import no.nordicsemi.android.mesh.utils.ProxyFilter;
 import no.nordicsemi.android.mesh.utils.ProxyFilterType;
 import no.nordicsemi.android.mesh.utils.RelaySettings;
+
+
 
 class DefaultNoOperationMessageState extends MeshMessageState {
 
@@ -85,6 +86,8 @@ class DefaultNoOperationMessageState extends MeshMessageState {
             mMeshStatusCallbacks.onMessageDecryptionFailed(e.getTag(), e.getMessage());
         }
     }
+
+    
 
     /**
      * Parses Access message received
@@ -536,12 +539,263 @@ class DefaultNoOperationMessageState extends MeshMessageState {
                     final VendorModelMessageStatus status = new VendorModelMessageStatus(message, vendorModelMessageUnacked.getModelIdentifier());
                     mMeshStatusCallbacks.onMeshMessageReceived(message.getSrc(), status);
                 } else {
-                    handleUnknownPdu(message);
+                       // Try resolving unsolicited vendor messages.
+    if (!tryResolveVendorModelAndDispatch(message, node)) {
+
+        // Preserve original SDK behavior.
+        handleUnknownPdu(message);
+    }else{
+        MeshLogger.verbose(TAG, "else tryResolveVendorModelAndDispatch is true");
+    }
+
                 }
                 break;
         }
     }
+/**
+ * Resolves unsolicited vendor messages using the
+ * source element's composition data.
+ *
+ * Returns true only when exactly one matching
+ * vendor model is found.
+ */
+private boolean tryResolveVendorModelAndDispatch(
+        @NonNull final AccessMessage message,
+        @Nullable final ProvisionedMeshNode node) {
 
+    MeshLogger.verbose(TAG,
+            "🔍 VENDOR_FALLBACK [START] src=0x" +
+                    Integer.toHexString(message.getSrc()) +
+                    " dst=0x" +
+                    Integer.toHexString(message.getDst()));
+
+    final byte[] accessPdu = message.getAccessPdu();
+
+    // STEP 1: Validate Access PDU
+    if (accessPdu == null) {
+        MeshLogger.error(TAG,
+                "❌ VENDOR_FALLBACK [STEP 1] FAILED: Access PDU is NULL");
+        return false;
+    }
+
+    MeshLogger.verbose(TAG,
+            "🔍 VENDOR_FALLBACK [STEP 1] Access PDU=" +
+                    MeshParserUtils.bytesToHex(accessPdu, false) +
+                    " length=" + accessPdu.length);
+
+    if (accessPdu.length < 3) {
+        MeshLogger.error(TAG,
+                "❌ VENDOR_FALLBACK [STEP 1] FAILED: PDU length < 3");
+        return false;
+    }
+
+    if ((accessPdu[0] & 0xC0) != 0xC0) {
+        MeshLogger.error(TAG,
+                "❌ VENDOR_FALLBACK [STEP 1] FAILED: Not a 3-byte vendor opcode");
+        return false;
+    }
+
+    MeshLogger.verbose(TAG,
+            "✅ VENDOR_FALLBACK [STEP 1] Valid vendor Access PDU");
+
+    // STEP 2: Validate node
+    if (node == null) {
+        MeshLogger.error(TAG,
+                "❌ VENDOR_FALLBACK [STEP 2] FAILED: Source node is NULL");
+        return false;
+    }
+
+    if (node.getElements() == null) {
+        MeshLogger.error(TAG,
+                "❌ VENDOR_FALLBACK [STEP 2] FAILED: Node elements are NULL");
+        return false;
+    }
+
+    MeshLogger.verbose(TAG,
+            "✅ VENDOR_FALLBACK [STEP 2] Node found. Total elements=" +
+                    node.getElements().size());
+
+    // STEP 3: Extract company ID and opcode
+    final int companyId =
+            (accessPdu[1] & 0xFF) |
+                    ((accessPdu[2] & 0xFF) << 8);
+
+    final int vendorOpcode = accessPdu[0] & 0xFF;
+
+    MeshLogger.verbose(TAG,
+            "🔍 VENDOR_FALLBACK [STEP 3] Company ID=0x" +
+                    Integer.toHexString(companyId) +
+                    " Vendor Opcode=0x" +
+                    Integer.toHexString(vendorOpcode));
+
+    // STEP 4: Find exact source element
+    final Element element =
+            node.getElements().get(message.getSrc());
+
+    if (element == null) {
+        MeshLogger.error(TAG,
+                "❌ VENDOR_FALLBACK [STEP 4] FAILED: Element not found for src=0x" +
+                        Integer.toHexString(message.getSrc()));
+        return false;
+    }
+
+    if (element.getMeshModels() == null) {
+        MeshLogger.error(TAG,
+                "❌ VENDOR_FALLBACK [STEP 4] FAILED: Element models are NULL");
+        return false;
+    }
+
+    MeshLogger.verbose(TAG,
+            "✅ VENDOR_FALLBACK [STEP 4] Element found. Total models=" +
+                    element.getMeshModels().size());
+
+    // STEP 5: Resolve expected model ID
+    final int expectedModelId =
+            getModelIdForVendorOpcode(vendorOpcode);
+
+    MeshLogger.verbose(TAG,
+            "🔍 VENDOR_FALLBACK [STEP 5] Expected Model ID=0x" +
+                    Integer.toHexString(expectedModelId));
+
+    if (expectedModelId == -1) {
+        MeshLogger.error(TAG,
+                "❌ VENDOR_FALLBACK [STEP 5] FAILED: No model mapping for opcode=0x" +
+                        Integer.toHexString(vendorOpcode));
+        return false;
+    }
+
+    // STEP 6: Search matching vendor model
+    Integer resolvedModelId = null;
+
+    int totalModels = 0;
+    int vendorModels = 0;
+    int companyMatches = 0;
+
+    for (MeshModel candidate : element.getMeshModels().values()) {
+
+        totalModels++;
+
+        if (!(candidate instanceof VendorModel)) {
+            MeshLogger.verbose(TAG,
+                    "⏭️ VENDOR_FALLBACK [STEP 6] Skipping non-vendor model=0x" +
+                            Integer.toHexString(candidate.getModelId()));
+            continue;
+        }
+
+        vendorModels++;
+
+        final VendorModel vendorModel = (VendorModel) candidate;
+
+        final int candidateCompanyId =
+                vendorModel.getCompanyIdentifier() & 0xFFFF;
+
+        final int candidateModelId =
+                candidate.getModelId();
+
+        MeshLogger.verbose(TAG,
+                "🔍 VENDOR_FALLBACK [STEP 6] Checking model=0x" +
+                        Integer.toHexString(candidateModelId) +
+                        " company=0x" +
+                        Integer.toHexString(candidateCompanyId));
+
+        if (candidateCompanyId != companyId) {
+            MeshLogger.verbose(TAG,
+                    "⏭️ VENDOR_FALLBACK [STEP 6] Company ID mismatch");
+            continue;
+        }
+
+        companyMatches++;
+
+        if ((candidateModelId & 0xFFFF) != expectedModelId) {
+            MeshLogger.verbose(TAG,
+                    "⏭️ VENDOR_FALLBACK [STEP 6] Model ID mismatch. " +
+                            "Expected=0x" +
+                            Integer.toHexString(expectedModelId) +
+                            " Actual=0x" +
+                            Integer.toHexString(candidateModelId & 0xFFFF));
+            continue;
+        }
+
+        if (resolvedModelId != null) {
+            MeshLogger.error(TAG,
+                    "❌ VENDOR_FALLBACK [STEP 6] FAILED: Multiple matching vendor models. " +
+                            "First=0x" +
+                            Integer.toHexString(resolvedModelId) +
+                            " Second=0x" +
+                            Integer.toHexString(candidateModelId));
+            return false;
+        }
+
+        resolvedModelId = candidateModelId;
+
+        MeshLogger.verbose(TAG,
+                "✅ VENDOR_FALLBACK [STEP 6] Matching vendor model found=0x" +
+                        Integer.toHexString(resolvedModelId));
+    }
+
+    MeshLogger.verbose(TAG,
+            "🔍 VENDOR_FALLBACK [STEP 6] Search summary: " +
+                    "totalModels=" + totalModels +
+                    " vendorModels=" + vendorModels +
+                    " companyMatches=" + companyMatches);
+
+    // STEP 7: Validate resolved model
+    if (resolvedModelId == null) {
+        MeshLogger.error(TAG,
+                "❌ VENDOR_FALLBACK [STEP 7] FAILED: No matching vendor model found. " +
+                        "src=0x" +
+                        Integer.toHexString(message.getSrc()) +
+                        " company=0x" +
+                        Integer.toHexString(companyId) +
+                        " expectedModel=0x" +
+                        Integer.toHexString(expectedModelId));
+        return false;
+    }
+
+    MeshLogger.verbose(TAG,
+            "✅ VENDOR_FALLBACK [STEP 7] Resolved Model ID=0x" +
+                    Integer.toHexString(resolvedModelId));
+
+    // STEP 8: Construct vendor status
+    final VendorModelMessageStatus status =
+            new VendorModelMessageStatus(
+                    message,
+                    resolvedModelId
+            );
+
+    MeshLogger.verbose(TAG,
+            "✅ VENDOR_FALLBACK [STEP 8] VendorModelMessageStatus created");
+
+    // STEP 9: Dispatch message
+    mMeshStatusCallbacks.onMeshMessageReceived(
+            message.getSrc(),
+            status
+    );
+
+    MeshLogger.verbose(TAG,
+            "✅ VENDOR_FALLBACK [SUCCESS] Message dispatched. " +
+                    "src=0x" +
+                    Integer.toHexString(message.getSrc()) +
+                    " model=0x" +
+                    Integer.toHexString(resolvedModelId));
+
+    return true;
+}
+
+private int getModelIdForVendorOpcode(int opcode) {
+    switch (opcode) {
+        case 0xE3:
+            return 0x0001; // Replace with actual Model A ID
+
+        case 0xE4:
+            return 0x0002; // Replace with actual Model B ID
+
+        default:
+            return -1;
+    }
+}
+
+    
     private void handleUnknownPdu(final AccessMessage message) {
         MeshLogger.verbose(TAG, "Unknown Access PDU Received: " + MeshParserUtils.bytesToHex(message.getAccessPdu(), false));
         mMeshStatusCallbacks.onUnknownPduReceived(message.getSrc(), message.getAccessPdu());
